@@ -1,0 +1,324 @@
+---
+title: "Home Data Science Challenge"
+output: html_notebook
+---
+
+# Introduction
+
+The goal of this challenge is to come up with the best price for a flat with these characteristics:
+
+* Address: Almstadtstraße 9/11, 10119 Berlin
+* Size: 78 sqm
+* Floor: 1st
+* Rooms: 2
+* Built-in kitchen: yes
+* Balcony: yes
+* Construction year: 1902
+* Condition: good
+* Quality: good
+
+
+# Exploratory Analysis and Data Wrangling
+
+```{r message=FALSE, warning=FALSE}
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(FNN)
+```
+
+
+```{r}
+df = read.csv("HomeDataScienceChallenge.csv", sep = ";", dec = ",")
+head(df)
+```
+
+The dataset contains information on Kaltmiete, Nebenkosten, Heizungkosten and the overall cost. The overall cost is missing for 3 homes. Given the very small dataset, every data point is precious therefore I will focus on predicting Kaltmiete instead of the overall cost. 
+
+The Scikit Learn ML guide agrees with me :P. If your dataset < 50 samples -> Get more data!
+http://scikit-learn.org/stable/tutorial/machine_learning_map/index.html.
+
+```{r}
+summary(df[c("kosten", "kstn_miete_gesamt")])
+```
+
+The flat for which a prediction needs to be made has only a few features available:
+
+* address
+* size
+* floor
+* rooms
+* built in kitchen
+* balcony 
+* construction year
+* quality
+* condition
+
+Therefore, the prediction model should only include these features. 
+
+```{r}
+df_mod = df[c(
+  "oadr_strasse",
+  "flaeche",
+  "etage",
+  "anz_zimmer",
+  "aus_kueche_einbau_janein",
+  "aus_balkon_terrasse_janein",
+  "baujahr",
+  "aus_klassen_empirica",
+  "zust_klassen_empirica",
+  "kosten"
+  )]
+```
+
+## Preprocessing and Imputation
+It's important to do some data preprocessing to make the model work. These features are boolean and shouldn't be considered as numeric ones:
+
+* aus_kueche_einbau_janein
+* aus_balkon_terrasse_janein
+
+In R boolean features can be represented with the data type *factor*.
+```{r}
+df_mod$aus_kueche_einbau_janein = as.factor(df_mod$aus_kueche_einbau_janein)
+df_mod$aus_balkon_terrasse_janein = as.factor(df_mod$aus_balkon_terrasse_janein)
+summary(df_mod)
+```
+
+There are some missing features in the dataset: the building year is not available for 8 homes. The missing points will be imputed with the median of the building year.
+
+```{r}
+df_mod[is.na(df_mod$baujahr), "baujahr"] <- median(df_mod$baujahr, na.rm = T)
+summary(df_mod)
+```
+
+## Feature Analysis
+
+The plot shows that the data supports the relationship between the rent price and:
+
+* number of rooms (1.5 rooms seems to be an outlier in the trend, but only because there's just 1 flat with 1.5 rooms)
+* terrace/balcony (the average price being 114 Euro higher for a flat with a balcony)
+* quality
+* built in kitchen
+* condition
+
+For the floor of a building we observe a weird trend, probably because of the lack of data. It's hard to believe that the average rent price decreases for buildings on the third floor or higher.
+
+```{r}
+df_mod %>%
+  gather(-oadr_strasse, -kosten, -flaeche, -baujahr, key = "var", value = "value") %>% 
+  ggplot(aes(x = value, y = kosten, col = flaeche)) + 
+  geom_point() + facet_wrap(~ var, scales = "free") +
+  theme(text = element_text(size=10), axis.text.x = element_text(angle=90, hjust=1)) + 
+  scale_colour_gradient(low = "white",high = "red") +
+  stat_summary(fun.y = mean, fun.ymin = mean, fun.ymax = mean, geom = "crossbar", width = 0.5)
+```
+
+The plot shows that the relationship between building year and rent price depends on the time period.
+
+```{r}
+df_mod[, c("kosten", "flaeche", "baujahr")] %>%
+  gather(-kosten, key = "var", value = "value") %>%
+  ggplot(aes(x = value, y = kosten)) + geom_point() + geom_smooth() +
+  facet_wrap( ~ var, scales = "free") +
+  theme(text = element_text(size = 10),
+  axis.text.x = element_text(angle = 90, hjust = 1))
+```
+
+The relation between building year and rent price is best described by a picewise function.
+
+```{r}
+qplot(
+  baujahr,
+  kosten,
+  group = baujahr < 1930,
+  geom = c('point', 'smooth'),
+  method = 'lm',
+  se = F,
+  data = df_mod
+  )
+```
+
+Let's create a feature that captures this relation.
+
+```{r}
+df_mod$baujahr_below1930 <- ifelse(df_mod$baujahr <= 1930, 0, 1)
+df_mod$baujahr_interaction <- df_mod$baujahr_below1930*(df_mod$baujahr-1930)
+```
+
+# Model Training
+As a first try, I will build a linear regression model. 
+
+## Validation Procedure
+Splitting data into a training and test set is necessary in order to avoid overfitting (the model memorises instead of learns).
+
+```{r}
+set.seed(100)
+train.ix <- sample(1:nrow(df_mod), size = 0.8*nrow(df_mod), replace = F)
+df_train <- df_mod[train.ix,]
+df_test <- df_mod[-train.ix,]
+```
+
+The train test price distribution shouldn't be too different, but it's difficult to ensure this with so few data points.
+
+```{r}
+par(mfrow = c(1, 3))
+boxplot(df_train$kosten, ylab="Price", main="Training Data")
+boxplot(df_test$kosten,  ylab="Price", main="Test Data")
+boxplot(df$kosten,  ylab="Price", main="All Data")
+```
+
+## Linear Regression
+
+
+```{r}
+features <- c('flaeche', 'anz_zimmer', 'baujahr',  'baujahr_interaction',
+              'aus_kueche_einbau_janein', 'aus_balkon_terrasse_janein', 
+              'aus_klassen_empirica', 'zust_klassen_empirica')
+features
+```
+
+```{r}
+model_formula <- formula(df_mod[c('kosten', features)])
+model_formula
+```
+
+This model leads to some strange results: e.g. number of rooms seems to have a negative effect on the price which is obviously wrong.
+The problem is that there's a high correlation between the number of rooms and flat size (as expected). A model like linear regression may lead to meaningless results in such a situation. To deal with this, I will try a non parametric Machine Learning Model called Kth Nearest Neighbor Regression.
+
+```{r}
+lin_reg = lm(model_formula,
+             data = df_train
+)
+summary(lin_reg)
+```
+
+
+```{r}
+cor(df_mod$flaeche, df_mod$anz_zimmer)
+```
+
+### Model Validation
+
+The plots show that there are some outliers in the data. Due to the very small amount of data I decided not to remove these outliers.
+
+```{r}
+plot(lin_reg)
+```
+
+### Error Analysis
+
+For the homes where the predicted rent is higher than the actual one, the average error is 132 Euro.
+The error is much higher for when we under-predict: on average being 209 Euro.
+In terms of the percentage of the home price, the error is on average 17.8%.
+We have to keep in mind that we only have 10 data points for analyzing the error :), so the statistics might not be very reliable.
+
+```{r}
+df_test$predicted_cost = predict(lin_reg, newdata=df_test)
+df_test$error = df_test$predicted_cost - df_test$kosten
+df_test$perc_error = abs(df_test$predicted_cost - df_test$kosten)/df_test$kosten
+mean(df_test$perc_error)
+```
+
+
+```{r}
+cor(df_test$kosten, df_test$predicted_cost)
+```
+
+```{r}
+mean(df_test$error[df_test$error>0])
+```
+
+```{r}
+mean(df_test$error[df_test$error<0])
+```
+
+```{r}
+mean(abs(df_test$error))
+```
+
+### Prediction
+The exciting part: what kind of rent will the model predict for our lovely new flat?
+The prediction from linear regression is 1225 Euro!
+
+```{r}
+df_pred = data.frame(
+  flaeche = 78,
+  etage = 1,
+  avg_room_size = 78/2,
+  anz_zimmer = 2,
+  aus_kueche_einbau_janein = 1,
+  aus_balkon_terrasse_janein = 1,
+  baujahr = 1902,
+  baujahr_interaction = 0,
+  aus_klassen_empirica = 'gut',
+  zust_klassen_empirica = 'gut',
+  stringsAsFactors = F
+  )
+df_pred$aus_kueche_einbau_janein <- as.factor(df_pred$aus_kueche_einbau_janein)
+df_pred$aus_balkon_terrasse_janein <- as.factor(df_pred$aus_balkon_terrasse_janein)
+df_pred
+```
+
+```{r}
+df_pred$predicted_cost = predict(lin_reg, newdata=df_pred)
+df_pred$predicted_cost
+```
+
+## Kth Nearest Neighbor Regression
+
+We saw in the previous section that a statistical model like linear regression gave strange results in terms of the effect of the number of rooms on the flat price. To solve the present data issues I try out a Machine Learning model.
+
+This leads to a much better prediction! The percentage error drops from 17.87% to 14.5%.
+This model tends to have higher errors when we overestimate the rent price, while the linear model had lower errors in the case of rent price underestimation.
+
+```{r}
+x_train <- model.matrix( ~ .-1, df_train[features])
+x_train <- subset(x_train, select = -aus_kueche_einbau_janein0)
+x_test <- model.matrix( ~ .-1, df_test[features])
+x_test <- subset(x_test, select = -aus_kueche_einbau_janein0)
+x_full <- model.matrix( ~ .-1, df_mod[features])
+x_full <- subset(x_full, select = -aus_kueche_einbau_janein0)
+
+knn <- knn.reg(train = x_train, test = x_test, y = df_train$kosten, k = 3)
+df_test$knn_predicted_cost <- knn$pred
+df_test$knn_error = df_test$knn_predicted_cost - df_test$kosten
+df_test$knn_perc_error = abs(df_test$knn_predicted_cost - df_test$kosten)/df_test$kosten
+mean(df_test$knn_perc_error)
+```
+
+```{r}
+mean(df_test$knn_error[df_test$knn_error>0])
+```
+
+```{r}
+mean(df_test$knn_error[df_test$knn_error<0])
+```
+
+```{r}
+mean(abs(df_test$knn_error))
+```
+
+
+
+## Prediction
+
+KNN Regression predicts a price of **1145 Euro** for our lovely new flat.
+
+```{r}
+x_pred = data.frame(
+  flaeche = 78,
+  anz_zimmer = 2,
+  aus_kueche_einbau_janein1 = 1,
+  aus_balkon_terrasse_janein1 = 1,
+  baujahr = 1902,
+  baujahr_interaction = 0,
+  aus_klassen_empiricagut = 1,
+  aus_klassen_empiricahochwertig = 0,
+  aus_klassen_empiricanormal = 0,
+  zust_klassen_empiricanormal = 0,
+  zust_klassen_empiricaschlecht = 0
+  )
+x_pred = as.matrix(x_pred[colnames(x_train)])
+knn.reg(train = x_full, test = x_pred, y = df_mod$kosten, k = 3)
+
+```
